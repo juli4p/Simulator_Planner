@@ -10,7 +10,7 @@ patient_type = "B1"
 possible_patient_types = ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4"]
 
 # amount of patients
-num_requests = 5
+num_requests = 25
 # initial arrival time and increase per patient in hours
 arrival_time = 8
 increase_arrival_time = 0.5
