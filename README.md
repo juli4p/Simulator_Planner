@@ -28,11 +28,12 @@ CPEE model attribute explanations:
 13. replanned_cpee_instance: in case of replan: new cpee instance that is created for the patient 
 
 Notes:
-1. If complications arise during surgery / nursing, the patient will queue again and receive further treatment according to their type and diagnosis.
-2. Assumption: if an er patient does not receive a further diagnosis after their treatment, they did not suffer from an illness => phantom pain => only patients that remain as "EM" only, suffer from phantom pain and will not go through surgery and or nursing.
-3. The simulator is reliant on the fact that all patients / instances get spawned in quick succesion (depending on the amount and delays a sleep timer can be increased /  decreased).
-4. Furthermore patients / instances have to be created in chronological order (increasing arrival time)
-5. The repository includes the simulator.py (which can be run on the lehre server), as well as a python program that can be used to spawn patients (arrival time, types, etc can be configured).
+1. Patients will only be replanned if treatment is not feasible. If feasible. patients will directly queue for treatment (even on first arrival).
+2. If complications arise during surgery / nursing, the patient will queue again and receive further treatment according to their type and diagnosis.
+3. Assumption: if an er patient does not receive a further diagnosis after their treatment, they did not suffer from an illness => phantom pain => only patients that remain as "EM" only, suffer from phantom pain and will not go through surgery and or nursing.
+4. The simulator is reliant on the fact that all patients / instances get spawned in quick succesion (depending on the amount and delays a sleep timer can be increased /  decreased).
+5. Furthermore patients / instances have to be created in chronological order (increasing arrival time)
+6. The repository includes the simulator.py (which can be run on the lehre server), as well as a python program that can be used to spawn patients (arrival time, types, etc can be configured).
 
 Usage of simulator:
 1. run simulator.py (on the lehre server)
