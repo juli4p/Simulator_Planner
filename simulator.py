@@ -148,14 +148,14 @@ def incoming_event():
 
 def run_while_loop():
     global time_now
-    
+
     # TODO set desired sleep time
     # works better with higher values but also causes slower simulation
     # also depends on current workload of the cpee server
     # 1s = very good
     # should be good for 0.5s and more
     sleep_duration = 0.5
-    
+
     # TODO set desired simualtion time
     # handle events in order until simulation time is reached (8760 hours = 1 year)
     while time_now < 8760.0:
@@ -180,8 +180,9 @@ def run_while_loop():
         if time_diff >= 0:
             print(f"INFO: time_now was set from {time_now} to {event_priority}.")
             if time_diff > 1:
-                # if this gets triggered sleep_duration is too low 
-                print(f"ERROR: Big time difference of {time_diff}")
+                # if this gets triggered sleep_duration is too low
+                print(f"ERROR: Big time difference of {time_diff}! Event was skipped!")
+                continue
         time_now = event_priority
 
         # check whether current time is a working hour (mo-fr 8-17)
