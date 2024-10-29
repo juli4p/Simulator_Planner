@@ -7,27 +7,31 @@ Dieses Projekt implementiert:
 5. eine Konfigurationsdatei für das Healthcare-Problem.
 
 Voraussetzungen:
--Python 3.8 oder höher
--bottle (Webserver)
--requests (HTTP-Anfragen)
--numpy (mathematische Funktionen und Wahrscheinlichkeitsberechnungen)
--Bearbeitung der Konfigurationsdatei (für den Simulator ist eine Konfigurationsdatei erforderlich, ein Beispiel für das Healthcare-Problem ist im Code enthalten)
+1. Python 3.8 oder höher
+2. bottle (Webserver)
+3. requests (HTTP-Anfragen)
+4. numpy (mathematische Funktionen und Wahrscheinlichkeitsberechnungen)
+5. Bearbeitung der Konfigurationsdatei (für den Simulator ist eine Konfigurationsdatei erforderlich, ein Beispiel für das Healthcare-Problem ist im Code enthalten)
 
 Anleitung zum Erstellen / Bearbeiten der Konfigurationsdatei:
 
 1. Die Konfigurationsdatei besteht aus einem Dictionary namens events.
 2. Jedes gewünschte Event wird als Schlüssel in diesem Dictionary hinzugefügt.
 3. Jedes dieser Events benötigt folgende Schlüssel:
-   -Capacity: Eine Liste von Kapazitätsregeln, die festlegt, zu welchen Zeiten (verschiedene Tage und Stunden, Tag 0 entspricht Montag) das Event Kapazitäten hat. Kapazitätsregeln werden von oben nach unten priorisiert (im Falle von Überschneidungen). Der Standardwert für nicht definierte Zeiten ist 0.
-   -Dependencies: Eine Liste von Events, die chronologisch vor dem aktuellen Event liegen müssen.
-   -Bookings: Speichert abgeschlossene Buchungen für das Event (zur Initialisierung leer lassen).
-   -Active Bookings: Speichert aktive Buchungen für das Event (zur Initialisierung leer lassen).
+   1. Capacity: Eine Liste von Kapazitätsregeln, die festlegt, zu welchen Zeiten (verschiedene Tage und Stunden, Tag 0 entspricht Montag) das Event Kapazitäten hat. Kapazitätsregeln werden von oben nach unten priorisiert (im Falle von Überschneidungen). Der Standardwert für nicht definierte Zeiten ist 0.
+   2. Dependencies: Eine Liste von Events, die chronologisch vor dem aktuellen Event liegen müssen.
+   3. Bookings: Speichert abgeschlossene Buchungen für das Event (zur Initialisierung leer lassen).
+   4. Active Bookings: Speichert aktive Buchungen für das Event (zur Initialisierung leer lassen).
 
 Starten der Simulation:
-
 1. Wechseln Sie in das Verzeichnis mit dem Code:
-   cd Pfad-zu/Sim_Code
+
+-cd Pfad-zu/Sim_Code
+
 2. Starten Sie den Simulator (er benötigt als Parameter die gewünschte Simulationsdauer in Minuten, 525600 entspricht 1 Jahr):
-   python3 Simulator.py 525600
+
+-python3 Simulator.py 525600
+
 3. Starten Sie den PatientSpawner (er benötigt als Parameter die gewünschte Simulationsdauer in Minuten, 525600 entspricht 1 Jahr):
-   python3 PatientSpawner.py 525600
+
+-python3 PatientSpawner.py 525600
