@@ -1,6 +1,6 @@
 Dieses Projekt implementiert:
 
-1. einen Simulator, der in Kombination mit der CPEE-Engine (https://cpee.org) ein spezifisches Problem simuliert.
+1. einen Simulator, der in Kombination mit der CPEE-Engine (https://cpee.org), basierend auf einer Konfigurationsdatei, ein Problem simulieren kann.
 2. einen Planner, der für ein spezifisches Healthcare-Problem (https://sites.google.com/view/bpo2024/competition) Patientenzeiten basierend auf einem genetischen Algorithmus plant.
 3. einen PatientSpawner, der es ermöglicht, CPEE-Instanzen zu generieren, um das Healthcare-Problem zu simulieren.
 4. einen Logger.
