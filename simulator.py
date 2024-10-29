@@ -1,602 +1,374 @@
-from bottle import Bottle, request, response
-import uuid, logging, random, heapq, threading, requests, time, json
+from bottle import Bottle, request, response, run
+from datetime import datetime, timedelta
+from Event_Logger import Logger
+from NaivePlanner import NaivePlanner
 
+# from GeneticPlanner import GeneticPlanner
+import sys, threading, time, json, requests
+import HealthcareProblem
 
-class Event:
-    def __init__(
-        self,
-        event_type: str,
-        event_start_time: float,
-        event_end_time: float,
-        patient_id: str,
-        patient_type: str,
-        callback_url: str,
-        cpee_instance: str = None,
-    ):
-        self.event_type = event_type
-        self.event_start_time = event_start_time
-        self.event_end_time = event_end_time
-        self.patient_id = patient_id
-        self.patient_type = patient_type
-        self.callback_url = callback_url
-        self.cpee_instance = cpee_instance
-
-    def __repr__(self):
-        return (
-            f"Event(event_type={self.event_type}, "
-            f"event_start_time={self.event_start_time}, "
-            f"event_end_time={self.event_end_time}, "
-            f"patient_id={self.patient_id}, "
-            f"patient_type={self.patient_type})"
-        )
-
-
-class TimePriorityQueue:
-    def __init__(self):
-        self._queue = []
-        self._index = 0
-
-    def push(self, item, priority):
-        heapq.heappush(self._queue, (priority, self._index, item))
-        self._index += 1
-
-    def pop(self, return_priority=False):
-        priority, index, item = heapq.heappop(self._queue)
-        if return_priority:
-            return item, priority
-        return item
-
-    def print_queue(self):
-        print("Current event queue:")
-        for priority, index, item in self._queue:
-            print(f"Priority: {priority}, Index: {index}, Event: {item}")
-
-
-# queue additionaly prioritizes EM events
-class EMTimePriorityQueue(TimePriorityQueue):
-    def push(self, item, priority):
-        if "EM" in item.patient_type:
-            priority = (0, item.event_start_time)
-        else:
-            priority = (1, item.event_start_time)
-        super().push(item, priority)
-
-    def pop(self, return_priority=False):
-        priority, index, item = heapq.heappop(self._queue)
-        if return_priority:
-            return item, priority[1]
-        return item
-
-
+# server configs
 app = Bottle()
-resources_available = {
-    "Intake": 4,
-    "Surgery": 5,
-    "Nursing A": 30,
-    "Nursing B": 40,
-    "EM": 9,
-}
-resources_max = {"Intake": 4, "Surgery": 5, "Nursing A": 30, "Nursing B": 40, "EM": 9}
-# only neccesery for Intake and Surgery
-resources_busy = {"Intake": 0, "Surgery": 0}
 
-# current time in hours
-time_now = 0.0
-# queues for stations
-event_queue = TimePriorityQueue()
-er_queue = TimePriorityQueue()
-surgery_queue = EMTimePriorityQueue()
-nursing_queue_A = EMTimePriorityQueue()
-nursing_queue_B = EMTimePriorityQueue()
+# general configs
+events = {}
+waiting_requests = []
+lock = threading.Lock()
+next_id = 1
+known_ids = set()
+last_StartEvent = 0
+logger = Logger("log.csv")
+SIMULATION_END = None
+SIMULATION_START = datetime(2018, 1, 1)
 
-# check whether time in hours lies between 8 and 17 and is a weekday
-is_working_hour = lambda h: 0 <= (h // 24) % 7 < 5 and 8 <= h % 24 < 17
+# case specific configs
+events = HealthcareProblem.events
+start_event = "Admission"  # chronological order only secured for this event
+replanned_requests = []
 
 
-@app.route("/incoming_event", method="POST")
-def incoming_event():
-    try:
-        event_type = request.forms.get("event_type", None)
-        # time of arrival of patient at station
-        event_start_time = round(float(request.forms.get("event_start_time", -1)), 2)
-        # initiate end time with -1, will be set when event is processed
-        event_end_time = -1.0
-        patient_id = request.forms.get("patient_id", None)
-        patient_type = request.forms.get("patient_type", None)
-        callback_url = request.headers.get("Cpee-Callback", None)
-        cpee_instance = request.headers.get("Cpee-Instance", None)
+@app.post("/incoming_event")
+def book_event():
+    with lock:
+        global next_id
+        # id is a positive int (everything else gets treated as new and is assigned an id)
+        id = request.forms.get("ID")
+        try:
+            id = int(id) if id is not None and int(id) > 0 else None
+        except (ValueError, TypeError):
+            id = None
+        if id is None:
+            id = next_id
+            next_id += 1
 
-        if any(
-            x is None
-            for x in [
-                patient_id,
-                patient_type,
-                event_start_time,
-                event_end_time,
-                callback_url,
-            ]
-        ):
-            response.status = 400
+        event_type = request.forms.get("Event_Type")
+        arrival_time = int(float(request.forms.get("Arrival_Time")))
+        duration = int(float(request.forms.get("Duration")))
+        metadata = request.forms.get("Metadata")  # for problem specific data
+        cpee_callback = request.headers.get("Cpee-Callback")
+
+        if arrival_time > SIMULATION_END:
+            response.status = 400  # Bad Request
             return {
-                "error": "Missing patient_id / patient_type / arrival_time in the request."
+                "error": f"Arrival time {arrival_time} exceeds simulation end time of {SIMULATION_END}"
             }
 
-        valid_types = ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4", "EM"]
-        if not any(type in patient_type for type in valid_types):
-            return {"error": "Patient_type / diagnosis is not valid."}
+        req = {
+            "id": id,
+            "event_type": event_type,
+            "arrival_time": arrival_time,
+            "duration": duration,
+            "metadata": metadata,
+            "cpee_callback": cpee_callback,
+        }
 
-        # add event to event queue and answer later when event is processed
-        event_queue.push(
-            Event(
-                event_type,
-                event_start_time,
-                event_end_time,
-                patient_id,
-                patient_type,
-                callback_url,
-                cpee_instance,
-            ),
-            event_start_time,
+        (can_process, start_time) = can_process_request(req)
+        if can_process:
+            return process_request(req, False, start_time)
+        else:
+            if event_type != start_event:
+                waiting_requests.append(req)
+            response.headers["Cpee-Callback"] = "true"
+            return
+
+
+@app.post("/plan_patient")
+def replan_patient():
+    planner = NaivePlanner(SIMULATION_START)
+    # g_planner = GeneticPlanner()
+    id = request.forms.get("ID")
+    arrival_time = int(float(request.forms.get("Arrival_Time")))
+    metadata = request.forms.get("Metadata")  # Für spezifische Problem-Daten
+    replanned_time = planner.plan(arrival_time)
+    # current_state = get_simulation_state(replanned_time)
+    # replanned_time = g_planner.plan(id, arrival_time, metadata, {"diagnosis": metadata}, current_state)
+
+    base_url = "https://cpee.org/flow/start/url/"
+    data = {
+        "behavior": "fork_running",
+        "url": "https://cpee.org/hub/server/Teaching.dir/Prak.dir/Challengers.dir/Julian_Simon.dir/Main.xml",
+        "init": f'{{"patient_id":"{id}","patient_type":"{metadata}","time_now":"{replanned_time}"}}',
+    }
+    try:
+        response = requests.post(base_url, data=data)
+        response_json = response.json()
+        print(
+            f"Patient {id} replanned to timeslot: {replanned_time} at CPEE: {response_json.get('CPEE-INSTANCE')} - Status Code: {response.status_code}"
         )
-        response.headers["CPEE-CALLBACK"] = "true"
-        return response
-
     except Exception as e:
-        response.status = 500
-        return {"error": f"Server error: {str(e)}"}
+        print(f"Error in replanning for patient {id}: {e}")
+    return {"replanned_time": replanned_time}
 
 
-def run_while_loop():
-    global time_now
+def get_capacity(event, start_time):
+    current_datetime = SIMULATION_START + timedelta(minutes=start_time)
+    weekday = current_datetime.weekday()
+    hour = current_datetime.hour
+    for rule in event["capacity"]:
+        if weekday in rule["days"] and rule["start_hour"] <= hour < rule["end_hour"]:
+            return rule["capacity"]
+    return 0
 
-    # TODO set desired sleep time
-    # works better with higher values but also causes slower simulation
-    # also depends on current workload of the cpee server
-    # 1s = very good
-    # should be good for 0.5s and more
-    sleep_duration = 0.5
 
-    # TODO set desired simualtion time
-    # handle events in order until simulation time is reached (8760 hours = 1 year)
-    while time_now < 8760.0:
+# Check whether any event can still influence the current event -> if not, the current event can be processed
+# if event can be processed, return (True, Start_Time)
+def can_process_request(req):
+    global last_StartEvent
+    global known_ids
+    global start_event
+    req_id = req["id"]
+    event_type = req["event_type"]
+    arrival_time = req["arrival_time"]
+    dependencies = events[event_type]["dependencies"]
 
-        time.sleep(sleep_duration)
+    # ---------cause of planner---------#
+    if event_type == start_event and req_id in known_ids:
+        replanned_requests.append(req)
+        return (False, None)
+    if event_type == start_event and req_id not in known_ids:
+        replanned_requests.sort(key=lambda x: x["arrival_time"])
+        for replanned_req in replanned_requests:
+            if replanned_req["arrival_time"] < arrival_time:
+                process_request(replanned_req, True, replanned_req["arrival_time"])
+                replanned_requests.remove(replanned_req)
+    # ---------cause of planner---------#
 
-        current_event = None
-        json_data = {"error": "No event occurred yet"}
-        # true for events that trigger a response to cpee
-        send_response = False
+    for waiting_req in waiting_requests:
+        if (
+            waiting_req["event_type"] == event_type
+            and waiting_req["arrival_time"] < arrival_time
+            and waiting_req["id"] != req_id
+        ):
+            return (False, None)
 
-        # get next chronological event, if none available, wait for 1 second
-        if len(event_queue._queue) > 0:
-            # startung task events trigger on start time finishing task events on end time -> get priority
-            current_event, event_priority = event_queue.pop(return_priority=True)
-        else:
-            time.sleep(1)
-            continue
+    # no dependencies (in our case Admission, Releasing)
+    if not dependencies and req_id not in known_ids:
+        return (True, arrival_time)
 
-        # set time to event time that is currently handled
-        time_diff = time_now - event_priority
-        if time_diff >= 0:
-            print(f"INFO: time_now was set from {time_now} to {event_priority}.")
-            if time_diff > 1:
-                # if this gets triggered sleep_duration is too low
-                print(f"ERROR: Big time difference of {time_diff}! Event was skipped!")
+    # check whether totally new requests might still arrive (that could be prioticized higher)
+    if last_StartEvent < arrival_time:
+        return (False, None)
+
+    # Check whether any dependency ends earlier and might still need to be proptized
+    for dep_event in dependencies:
+        dep_bookings = events[dep_event]["active_bookings"]
+        for dep_booking in dep_bookings:
+            if dep_booking["id"] == req_id:
                 continue
-        time_now = event_priority
+            if dep_booking["end_time"] < arrival_time:
+                return (False, None)
 
-        # check whether current time is a working hour (mo-fr 8-17)
-        if is_working_hour(time_now) == True:
-            resources_max["Intake"] = 4
-            resources_max["Surgery"] = 5
-            resources_available["Intake"] = 4 - resources_busy["Intake"]
-            resources_available["Surgery"] = 5 - resources_busy["Surgery"]
-        else:
-            resources_max["Intake"] = 0
-            resources_max["Surgery"] = 1
-            resources_available["Intake"] = 0
-            resources_available["Surgery"] = 1 - resources_busy["Surgery"]
-
-        # EVENT: PATIENT_ADMISSION
-        if current_event.event_type == "patient_admission":
-
-            # check whether intake is available
-            if (
-                resources_available.get("Intake", 0) > 0
-                and len(surgery_queue._queue)
-                + len(nursing_queue_A._queue)
-                + len(nursing_queue_B._queue)
-                < 2
-            ):
-                treatment_feasible = True
-            else:
-                treatment_feasible = False
-
-            # er patients always get treated / queued for er treatment
-            if "EM" in current_event.patient_type:
-                treatment_feasible = True
-
-            if treatment_feasible and "EM" not in current_event.patient_type:
-                # already decrease intake ressources for non er patients (since there is no intake queue)
-                if resources_available.get("Intake", 0) > 0:
-                    resources_available["Intake"] -= 1
-                    resources_busy["Intake"] += 1
-
-            # check whether id exists, else create one
-            if current_event.patient_id == "nicht vergeben":
-                current_event.patient_id = str(uuid.uuid4())
-
-            send_response = True
-            json_data = {
-                "patient_id": current_event.patient_id,
-                "current_time": time_now,
-                "treatment_feasible": treatment_feasible,
-            }
-
-        # REPLAN_PATIENT
-        elif current_event.event_type == "replan_patient":
-            # spawn new cpee instance, with arrival time in 1 day (24 hours)
-            try:
-                # replan in 26h to avoid infinite 0 intakes loop
-                response = requests.post(
-                    "https://cpee.org/flow/start/url/",
-                    data={
-                        "behavior": "fork_running",
-                        "url": "https://cpee.org/hub/server/Teaching.dir/Prak.dir/Challengers.dir/Julian_Simon.dir/Main.xml",
-                        "init": f'{{"arrival_time":"{time_now+26}","patient_type":"{current_event.patient_type}","patient_id":"{current_event.patient_id}","log":"Replanned_"}}',
-                    },
-                )
-                cpee_inst = response.json().get("CPEE-INSTANCE")
-                print(
-                    f"Patient: {current_event.patient_id} replanned at CPEE-Instance: , {cpee_inst}"
-                )
-            except Exception as e:
-                print(f"An error occurred: {str(e)}")
-
-            # inform waiting cpee when intake was finished
-            send_response = True
-            json_data = {
-                "current_time": time_now,
-                "cpee_inst": cpee_inst,
-            }
-
-        # EVENT: INTAKE
-        elif current_event.event_type == "intake":
-            # check whether intake is available already happens at admission -> create intake finished event
-            t_intake_finished = round(time_now + random.normalvariate(1, 0.125), 2)
-            event_queue.push(
-                Event(
-                    "intake_finished",
-                    time_now,
-                    t_intake_finished,
-                    current_event.patient_id,
-                    current_event.patient_type,
-                    current_event.callback_url,
-                ),
-                t_intake_finished,
+    # Calculate start time, check whether start time is still in the allowed time frame -> no events could still arrive before start time
+    event = events[event_type]
+    bookings = event["bookings"]
+    start_time = arrival_time
+    while True:
+        capacity = get_capacity(event, start_time)
+        if capacity == 0:
+            start_time += 1
+            continue
+        overlapping_bookings = [
+            b
+            for b in bookings
+            if not (
+                b["end_time"] < start_time
+                or b["start_time"] > start_time + req["duration"]
             )
+        ]
+        if len(overlapping_bookings) < capacity:
+            break
+        start_time = min(b["end_time"] for b in overlapping_bookings) + 1
+    if last_StartEvent < start_time:
+        return (False, None)
 
-        # EVENT: INTAKE_FINISHED
-        elif current_event.event_type == "intake_finished":
+    ###-----------------------------------------Case specific (Priorizize EM Patients)-----------------------------------------###
+    for waiting_req in waiting_requests:
+        if (
+            "EM" in (waiting_req["metadata"] or "")
+            and waiting_req["event_type"] == event_type
+            and waiting_req["arrival_time"] < start_time
+            and req_id != waiting_req["id"]
+        ):
+            process_request(waiting_req, True, start_time)
+            waiting_requests.remove(waiting_req)
+            return (False, None)
+    ###-----------------------------------------Case specific (Priorizize EM Patients)-----------------------------------------###
 
-            # inform waiting cpee when intake was finished
-            send_response = True
-            json_data = {
-                "intake_start": current_event.event_start_time,
-                "intake_end": time_now,
-            }
+    # event may be processed for start_time
+    return (True, start_time)
 
-            # no need to check for waiting patients cause they would not be admitted if intake is full
-            if resources_available.get("Intake", 0) < resources_max.get("Intake", 0):
-                resources_available["Intake"] += 1
-            # decrease busy intake resources also if max is reached
-            if resources_busy.get("Intake", 0) > 0:
-                resources_busy["Intake"] -= 1
 
-        # ER_TREATMENT
-        elif current_event.event_type == "er_treatment":
-            # calc er duration
-            t_er_finished = round(time_now + random.normalvariate(2, 0.5), 2)
-            er_event = Event(
-                "er_treatment_finished",
-                time_now,
-                t_er_finished,
-                current_event.patient_id,
-                current_event.patient_type,
-                current_event.callback_url,
-            )
+def process_request(req, async_response, start_time):
+    global last_StartEvent
+    global start_event
 
-            # check availability
-            if resources_available.get("EM", 0) > 0:
-                resources_available["EM"] -= 1
-                event_queue.push(er_event, t_er_finished)
-            # else queue patient
-            else:
-                # prioitize by arrival time in queue
-                er_queue.push(er_event, current_event.event_start_time)
+    event_type = req["event_type"]
+    arrival_time = req["arrival_time"]
+    duration = req["duration"]
+    id = req["id"]
+    metadata = req["metadata"]
+    cpee_callback = req["cpee_callback"]
 
-        # EVENT: ER_TREATMENT_FINISHED
-        elif current_event.event_type == "er_treatment_finished":
+    event = events[event_type]
+    bookings = event["bookings"]
+    active_bookings = event["active_bookings"]
 
-            # check for further diagnosis (50% prob) and add type if true
-            # no diagnosis => phantom pain => type stays as "EM"
-            further_treatment_types = ["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4"]
-            if random.random() < 0.5:
-                current_event.patient_type = f"{current_event.patient_type}-{random.choice(further_treatment_types)}"
+    end_time = start_time + duration
 
-            # inform waiting cpee when er_treatment was finished, update patient_type
-            send_response = True
-            json_data = {
-                "er_start": current_event.event_start_time,
-                "er_end": time_now,
-                "patient_type": current_event.patient_type,
-            }
+    booking = {
+        "id": id,
+        "event_type": event_type,
+        "start_time": start_time,
+        "end_time": end_time,
+        "arrival_time": arrival_time,
+        "duration": duration,
+        "metadata": metadata,
+    }
 
-            # check whether someone is waiting for er_treatment, if yes let him in
-            if len(er_queue._queue) > 0:
-                waiting_er = er_queue.pop()
-                waiting_er_end_time = round(
-                    time_now
-                    + (waiting_er.event_end_time - waiting_er.event_start_time),
-                    2,
-                )
-                event_queue.push(
-                    Event(
-                        "er_treatment_finished",
-                        time_now,
-                        waiting_er_end_time,
-                        waiting_er.patient_id,
-                        waiting_er.patient_type,
-                        waiting_er.callback_url,
-                    ),
-                    waiting_er_end_time,
-                )
-            # else release ressource
-            else:
-                if resources_available.get("EM", 0) < resources_max.get("EM", 0):
-                    resources_available["EM"] += 1
+    bookings.append(booking)
+    active_bookings.append(booking)
 
-        # EVENT: NURSING
-        elif current_event.event_type == "nursing":
+    # delete old booking for id (only from active bookings)
+    for event_name, event_data in events.items():
+        if event_name != event_type:
+            other_bookings = event_data["active_bookings"]
+            event_data["active_bookings"] = [b for b in other_bookings if b["id"] != id]
 
-            # time needed for nursing, depending on patient_type
-            if "A1" in current_event.patient_type:
-                nursing_duration = random.normalvariate(4, 0.5)
-            elif (
-                "A2" in current_event.patient_type or "B1" in current_event.patient_type
-            ):
-                nursing_duration = random.normalvariate(8, 2)
-            elif (
-                "B3" in current_event.patient_type or "B4" in current_event.patient_type
-            ):
-                nursing_duration = random.normalvariate(16, 4)
-            else:
-                nursing_duration = random.normalvariate(16, 2)
+    logger.log_event(id, event_type, arrival_time, start_time, end_time, metadata)
+    response_data = {
+        "id": id,
+        "arrival_time": arrival_time,
+        "start_time": start_time,
+        "end_time": end_time,
+    }
 
-            t_nursing_finished = round(time_now + nursing_duration, 2)
+    if event_type == start_event:
+        if (
+            id not in known_ids
+        ):  # replanned requests arent necessarily in the right order
+            last_StartEvent = arrival_time
+            known_ids.add(id)
+        if not "EM" in (metadata or ""):
+            response_data = handle_HCProblem_logic(
+                req
+            )  # case specific: send home or not
 
-            nursing_event = Event(
-                "nursing_finished",
-                time_now,
-                t_nursing_finished,
-                current_event.patient_id,
-                current_event.patient_type,
-                current_event.callback_url,
-            )
+    if async_response:
+        headers = {"Content-Type": "application/json"}
+        requests.put(cpee_callback, data=json.dumps(response_data), headers=headers)
+    else:
+        return response_data
 
-            # check availability for type A patients
-            if "A" in current_event.patient_type:
-                if resources_available.get("Nursing A", 0) > 0:
-                    resources_available["Nursing A"] -= 1
-                    event_queue.push(nursing_event, t_nursing_finished)
-                # else queue patient
+
+def process_waiting_requests():
+    global waiting_requests
+    while True:
+        with lock:
+            waiting_requests = sorted(waiting_requests, key=lambda x: x["arrival_time"])
+            index = 0
+            while index < len(waiting_requests):
+                req = waiting_requests[index]
+                (can_process, start_time) = can_process_request(req)
+                if can_process:
+                    process_request(req, True, start_time)
+                    waiting_requests.remove(req)
                 else:
-                    # prioitize by arrival time in queue (ER patients first)
-                    nursing_queue_A.push(nursing_event, current_event.event_start_time)
+                    index += 1
+        time.sleep(0.5)
 
-            # check availability for type B patients
-            elif "B" in current_event.patient_type:
-                if resources_available.get("Nursing B", 0) > 0:
-                    resources_available["Nursing B"] -= 1
-                    event_queue.push(nursing_event, t_nursing_finished)
-                # else queue patient
-                else:
-                    # prioitize by arrival time in queue (ER patients first)
-                    nursing_queue_B.push(nursing_event, current_event.event_start_time)
 
-            else:
-                print("ERROR: Nursing should only be called for A or B patients")
+def handle_HCProblem_logic(req):
 
-        # NURSING_FINISHED
-        elif current_event.event_type == "nursing_finished":
+    def check_traffic(event_type, arrival_time):
+        global waiting_requests
+        capacity = get_capacity(events[event_type], arrival_time)
+        active_bs = [
+            b
+            for b in events[event_type]["bookings"]
+            if b["start_time"] <= arrival_time < b["end_time"]
+        ]
+        waiting_rs = [
+            r
+            for r in waiting_requests
+            if r["event_type"] == event_type and r["arrival_time"] <= arrival_time
+        ]
+        total_requests = len(active_bs) + len(waiting_rs)
+        return total_requests, capacity
 
-            # complications during nursing
-            complications_nursing = False
-            # calc nursing complications
-            if (
-                "A1" in current_event.patient_type
-                or "A2" in current_event.patient_type
-                or "B2" in current_event.patient_type
-            ):
-                nursing_complication_prob = 0.01
-            elif "B1" in current_event.patient_type:
-                nursing_complication_prob = 0.001
-            else:
-                nursing_complication_prob = 0.02
-            if random.random() < nursing_complication_prob:
-                complications_nursing = True
+    arrival_time = req["arrival_time"]
+    id = req["id"]
 
-            # inform waiting cpee when nursing was finished, whether complications occured
-            send_response = True
-            json_data = {
-                "nursing_start": current_event.event_start_time,
-                "nursing_end": time_now,
-                "complications_nursing": complications_nursing,
-            }
+    total_intake_requests, intake_capacity = check_traffic("Intake", arrival_time)
+    if total_intake_requests >= intake_capacity:
+        print(f"Sending patient {id} home due to intake capacity")
+        return {"send_home": True, "id": id}
 
-            # check whether someone is waiting for nursing A, if yes let him in
-            if "A" in current_event.patient_type:
-                if len(nursing_queue_A._queue) > 0:
-                    waiting_nursing_A = nursing_queue_A.pop()
-                    waiting_nursing_A_end_time = round(
-                        time_now
-                        + (
-                            waiting_nursing_A.event_end_time
-                            - waiting_nursing_A.event_start_time
-                        ),
-                        2,
-                    )
-                    event_queue.push(
-                        Event(
-                            "nursing_finished",
-                            time_now,
-                            waiting_nursing_A_end_time,
-                            waiting_nursing_A.patient_id,
-                            waiting_nursing_A.patient_type,
-                            waiting_nursing_A.callback_url,
-                        ),
-                        waiting_nursing_A_end_time,
-                    )
-                # else release ressource
-                else:
-                    if resources_available.get("Nursing A", 0) < resources_max.get(
-                        "Nursing A", 0
-                    ):
-                        resources_available["Nursing A"] += 1
+    event_types = ["Surgery", "Nursing_A", "Nursing_B"]
+    excess_requests = 0
 
-            # same for type B
-            elif "B" in current_event.patient_type:
-                if len(nursing_queue_B._queue) > 0:
-                    waiting_nursing_B = nursing_queue_B.pop()
-                    waiting_nursing_B_end_time = round(
-                        time_now
-                        + (
-                            waiting_nursing_B.event_end_time
-                            - waiting_nursing_B.event_start_time
-                        ),
-                        2,
-                    )
-                    event_queue.push(
-                        Event(
-                            "nursing_finished",
-                            time_now,
-                            waiting_nursing_B_end_time,
-                            waiting_nursing_B.patient_id,
-                            waiting_nursing_B.patient_type,
-                            waiting_nursing_B.callback_url,
-                        ),
-                        waiting_nursing_B_end_time,
-                    )
-                # else release ressource
-                else:
-                    if resources_available.get("Nursing B", 0) < resources_max.get(
-                        "Nursing B", 0
-                    ):
-                        resources_available["Nursing B"] += 1
-            else:
-                print("ERROR: Nursing should only be called for A or B patients")
-
-        # EVENT: SURGERY
-        elif current_event.event_type == "surgery":
-
-            # time needed for surgery, depending on patient_type
-            if "A2" in current_event.patient_type:
-                surgery_duration = random.normalvariate(1, 0.25)
-            elif "A3" in current_event.patient_type:
-                surgery_duration = random.normalvariate(2, 0.5)
-            elif "B4" in current_event.patient_type:
-                surgery_duration = random.normalvariate(4, 1)
-            else:
-                surgery_duration = random.normalvariate(4, 0.5)
-
-            t_surgery_finished = round(time_now + surgery_duration, 2)
-
-            surgery_event = Event(
-                "surgery_finished",
-                time_now,
-                t_surgery_finished,
-                current_event.patient_id,
-                current_event.patient_type,
-                current_event.callback_url,
-            )
-
-            # check whether surgery is available
-            if resources_available.get("Surgery", 0) > 0:
-                resources_available["Surgery"] -= 1
-                resources_busy["Surgery"] += 1
-                event_queue.push(surgery_event, t_surgery_finished)
-            # else queue patient
-            else:
-                # prioitize by arrival time in queue (ER patients first)
-                surgery_queue.push(surgery_event, current_event.event_start_time)
-
-        # SURGERY_FINISHED
-        elif current_event.event_type == "surgery_finished":
-
-            # complications during surgery
-            complications_surgery = False
-            # all surgerys 2% chance of complications, only A2 = 1%
-            if "A2" in current_event.patient_type:
-                surgery_complication_prob = 0.01
-            else:
-                surgery_complication_prob = 0.02
-            if random.random() < surgery_complication_prob:
-                complications_surgery = True
-
-            # inform waiting cpee when surgery was finished, whether complications occured
-            send_response = True
-            json_data = {
-                "surgery_start": current_event.event_start_time,
-                "surgery_end": time_now,
-                "complications_surgery": complications_surgery,
-            }
-
-            # check whether someone is waiting for surgery, if yes let him in
-            if len(surgery_queue._queue) > 0:
-                waiting_surgery = surgery_queue.pop()
-                waiting_surgery_end_time = round(
-                    time_now
-                    + (
-                        waiting_surgery.event_end_time
-                        - waiting_surgery.event_start_time
-                    ),
-                    2,
-                )
-                event_queue.push(
-                    Event(
-                        "surgery_finished",
-                        time_now,
-                        waiting_surgery_end_time,
-                        waiting_surgery.patient_id,
-                        waiting_surgery.patient_type,
-                        waiting_surgery.callback_url,
-                    ),
-                    waiting_surgery_end_time,
-                )
-            # else release ressource
-            else:
-                if resources_available.get("Surgery", 0) < resources_max.get(
-                    "Surgery", 0
-                ):
-                    resources_available["Surgery"] += 1
-                    if resources_busy.get("Surgery", 0) > 0:
-                        resources_busy["Surgery"] -= 1
-                    else:
-                        print("ERROR: There should be busy surgery resources")
-
-        # send response to callback url, depending on event that happened
-        if send_response == True:
-            try:
-                response = requests.put(current_event.callback_url, json=json_data)
-                # Testing only
-                print(
-                    f"Arbeitswoche: {is_working_hour(time_now) == True}\nRessource_available: {resources_available}\nRessources_max: {resources_max} \nResources_busy: {resources_busy}\nCpee-Instance: {current_event.cpee_instance}"
-                )
-            except requests.exceptions.RequestException as e:
-                print(f"An error occurred: {str(e)}")
+    for event_type in event_types:
+        total_requests, capacity = check_traffic(event_type, arrival_time)
+        if total_requests > capacity:
+            excess_requests += total_requests - capacity
+    if excess_requests > 2:
+        print(f"Sending patient {id} home due to excess requests: {excess_requests}")
+        return {"send_home": True, "id": id}
+    return {"send_home": False, "id": id}
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_while_loop)
-    t.start()
-    app.run(host="::1", port=57874, debug=True)
+    threading.Thread(target=process_waiting_requests, daemon=True).start()
+    if len(sys.argv) < 2:
+        print("Bitte geben Sie die Simulationsdauer in Minuten an.")
+        sys.exit(1)
+    SIMULATION_END = int(sys.argv[1])
+    run(app, host="::1", port=57874)
+
+
+def get_simulation_state(time):
+    state = []
+    for event_type, event_data in events.items():
+        for booking in event_data["bookings"]:
+            if booking["start_time"] < time and booking["end_time"] >= time:
+                state.append(
+                    {
+                        "cid": booking["id"],
+                        "task": event_type,
+                        "start": booking["start_time"],
+                        "info": {"diagnosis": booking["metadata"]},
+                        "wait": False,
+                    }
+                )
+        for booking in event_data["active_bookings"]:
+            if booking["start_time"] > time:
+                state.append(
+                    {
+                        "cid": booking["id"],
+                        "task": event_type,
+                        "start": booking["arrival_time"],
+                        "info": {"diagnosis": booking["metadata"]},
+                        "wait": True,
+                    }
+                )
+    for req in waiting_requests:
+        if req["start_time"] < time and booking["end_time"] >= time:
+            state.append(
+                {
+                    "cid": req["id"],
+                    "task": req["event_type"],
+                    "start": req["arrival_time"],
+                    "info": {"diagnosis": req["metadata"]},
+                    "wait": False,
+                }
+            )
+        elif booking["start_time"] > time:
+            state.append(
+                {
+                    "cid": req["id"],
+                    "task": req["event_type"],
+                    "start": req["arrival_time"],
+                    "info": {"diagnosis": req["metadata"]},
+                    "wait": True,
+                }
+            )
+    return json.dumps(state, indent=4)
