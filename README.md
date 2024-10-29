@@ -4,7 +4,7 @@ Dieses Projekt implementiert:
 2. einen Planner, der für ein spezifisches Healthcare-Problem (https://sites.google.com/view/bpo2024/competition) Patientenzeiten basierend auf einem genetischen Algorithmus plant.
 3. einen PatientSpawner, der es ermöglicht, CPEE-Instanzen zu generieren, um das Healthcare-Problem zu simulieren.
 4. einen Logger.
-5. Außerdem ist eine Konfigurationsdatei für das Healthcare-Problem enthalten.
+5. eine Konfigurationsdatei für das Healthcare-Problem.
 
 Voraussetzungen:
 -Python 3.8 oder höher
@@ -13,7 +13,7 @@ Voraussetzungen:
 -numpy (mathematische Funktionen und Wahrscheinlichkeitsberechnungen)
 -Bearbeitung der Konfigurationsdatei (für den Simulator ist eine Konfigurationsdatei erforderlich, ein Beispiel für das Healthcare-Problem ist im Code enthalten)
 
-Anleitung zur Konfiguration von Events:
+Anleitung zum Erstellen / Bearbeiten der Konfigurationsdatei:
 
 1. Die Konfigurationsdatei besteht aus einem Dictionary namens events.
 2. Jedes gewünschte Event wird als Schlüssel in diesem Dictionary hinzugefügt.
